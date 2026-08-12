@@ -1,0 +1,844 @@
+#!/usr/bin/env python3
+"""
+beeper — CLI for the Beeper Desktop local REST API (http://localhost:23373/v1/...).
+
+Self-contained: Python 3.9+ standard library only. Never shells out.
+
+Token resolution order:
+  1. $BEEPER_ACCESS_TOKEN
+  2. <skill dir>/token  (i.e. ../token relative to this script's real path)
+"""
+
+import argparse
+import base64
+import json
+import mimetypes
+import os
+import shutil
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+BASE_URL = os.environ.get("BEEPER_API_URL", "http://localhost:23373")
+TIMEOUT = 60
+
+CONN_REFUSED_MSG = "Beeper Desktop is not running. Open the Beeper Desktop app and retry."
+
+
+# --------------------------------------------------------------------------- #
+# plumbing
+# --------------------------------------------------------------------------- #
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def token_path():
+    """Path of the token file this install reads: <skill dir>/token."""
+    return Path(__file__).resolve().parent.parent / "token"
+
+
+def token_rejected_msg():
+    return (
+        "Token rejected — regenerate in Beeper Desktop → Settings → Integrations "
+        "and update %s" % token_path()
+    )
+
+
+def get_token():
+    tok = os.environ.get("BEEPER_ACCESS_TOKEN")
+    if tok and tok.strip():
+        return tok.strip()
+    token_file = token_path()
+    try:
+        tok = token_file.read_text().strip()
+    except OSError as e:
+        die("No token: set $BEEPER_ACCESS_TOKEN or create %s (%s)" % (token_file, e))
+    if not tok:
+        die("Token file %s is empty." % token_file)
+    return tok
+
+
+def encode_params(params):
+    """Query params; list values are repeated (style=form, explode=true)."""
+    pairs = []
+    for k, v in (params or {}).items():
+        if v is None:
+            continue
+        if isinstance(v, (list, tuple)):
+            for item in v:
+                if item is not None:
+                    pairs.append((k, str(item)))
+        elif isinstance(v, bool):
+            pairs.append((k, "true" if v else "false"))
+        else:
+            pairs.append((k, str(v)))
+    return urllib.parse.urlencode(pairs)
+
+
+def request(method, path, params=None, body=None, raw_bytes=False):
+    url = BASE_URL.rstrip("/") + path
+    qs = encode_params(params)
+    if qs:
+        url += "?" + qs
+
+    data = None
+    headers = {
+        "Authorization": "Bearer " + get_token(),
+        "Accept": "application/json",
+        "User-Agent": "beeper-cli/1.0",
+    }
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            payload = resp.read()
+            if raw_bytes:
+                return payload
+            if not payload:
+                return None
+            try:
+                return json.loads(payload.decode("utf-8"))
+            except ValueError:
+                return payload.decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")
+        if e.code == 401:
+            die(token_rejected_msg(), 1)
+        die("HTTP %s %s\n%s" % (e.code, e.reason, detail), 1)
+    except urllib.error.URLError as e:
+        reason = getattr(e, "reason", e)
+        if isinstance(reason, ConnectionRefusedError) or "refused" in str(reason).lower():
+            die(CONN_REFUSED_MSG, 2)
+        die("Network error contacting Beeper API: %s" % reason, 2)
+    except ConnectionRefusedError:
+        die(CONN_REFUSED_MSG, 2)
+
+
+# --------------------------------------------------------------------------- #
+# formatting helpers
+# --------------------------------------------------------------------------- #
+
+def out_json(obj):
+    print(json.dumps(obj, indent=2, ensure_ascii=False))
+
+
+def local_time(ts):
+    """ISO8601 / epoch-ms -> compact local time string."""
+    if ts in (None, ""):
+        return "?"
+    try:
+        if isinstance(ts, (int, float)):
+            dt = datetime.fromtimestamp(ts / 1000.0 if ts > 1e11 else ts)
+        else:
+            s = str(ts).replace("Z", "+00:00")
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.astimezone()
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(ts)
+
+
+_TAG_RE = None
+
+
+def detag(text):
+    """Message bodies can contain light HTML (<br>, <strong>, <a href>). Flatten it
+    for display only; --json always returns the untouched API payload."""
+    global _TAG_RE
+    if not text:
+        return text
+    import re
+    import html as _html
+    if _TAG_RE is None:
+        _TAG_RE = re.compile(r"<[^>]+>")
+    s = str(text)
+    s = re.sub(r"(?i)<br\s*/?>", "\n", s)
+    s = re.sub(r"(?i)</p\s*>", "\n", s)
+    s = _TAG_RE.sub("", s)
+    return _html.unescape(s)
+
+
+def one_line(text, width=110):
+    if not text:
+        return ""
+    t = " ".join(str(text).split())
+    return t if len(t) <= width else t[: width - 1] + "…"
+
+
+def fmt_chat(c, indent=""):
+    flags = []
+    if c.get("unreadCount"):
+        flags.append("%d unread" % c["unreadCount"])
+    if c.get("isArchived"):
+        flags.append("archived")
+    if c.get("isMuted"):
+        flags.append("muted")
+    if c.get("isPinned"):
+        flags.append("pinned")
+    parts = c.get("participants") or {}
+    total = parts.get("total")
+    head = "%s%s  [%s]" % (indent, c.get("title") or "(untitled)", c.get("type") or "?")
+    if total:
+        head += " %d participants" % total
+    if flags:
+        head += "  (" + ", ".join(flags) + ")"
+    lines = [head]
+    lines.append("%s  id: %s" % (indent, c.get("id")))
+    meta = "%s  account: %s" % (indent, c.get("accountID"))
+    if c.get("lastActivity"):
+        meta += "   last: %s" % local_time(c["lastActivity"])
+    lines.append(meta)
+    prev = c.get("preview")
+    if prev:
+        who = prev.get("senderName") or ("me" if prev.get("isSender") else prev.get("senderID", ""))
+        lines.append("%s  > %s: %s" % (indent, who, one_line(detag(prev.get("text")) or _attach_hint(prev), 90)))
+    return "\n".join(lines)
+
+
+def _attach_hint(m):
+    atts = m.get("attachments") or []
+    if not atts:
+        return ""
+    bits = []
+    for a in atts:
+        label = a.get("type") or "file"
+        if a.get("isVoiceNote"):
+            label = "voiceNote"
+        elif a.get("isSticker"):
+            label = "sticker"
+        elif a.get("isGif"):
+            label = "gif"
+        name = a.get("fileName")
+        bits.append("[%s%s]" % (label, ": " + name if name else ""))
+    return " ".join(bits)
+
+
+def fmt_message(m, chat_title=None):
+    who = m.get("senderName") or ("me" if m.get("isSender") else m.get("senderID") or "?")
+    if m.get("isSender"):
+        who += " (me)"
+    head = "[%s] %s" % (local_time(m.get("timestamp")), who)
+    if chat_title:
+        head += "  — %s" % chat_title
+    if m.get("isUnread"):
+        head += "  •UNREAD"
+    lines = [head]
+    text = detag(m.get("text"))
+    if text:
+        for ln in str(text).splitlines():
+            lines.append("    " + ln)
+    hint = _attach_hint(m)
+    if hint:
+        lines.append("    " + hint)
+        for a in m.get("attachments") or []:
+            if a.get("srcURL"):
+                lines.append("    srcURL: %s" % a["srcURL"])
+    reactions = m.get("reactions") or []
+    if reactions:
+        lines.append("    reactions: " + " ".join(r.get("reactionKey", "?") for r in reactions))
+    if m.get("linkedMessageID"):
+        lines.append("    reply-to: %s" % m["linkedMessageID"])
+    lines.append("    msgID: %s" % m.get("id"))
+    return "\n".join(lines)
+
+
+def fmt_user(u):
+    bits = [u.get("fullName") or u.get("username") or u.get("id")]
+    if u.get("phoneNumber"):
+        bits.append(u["phoneNumber"])
+    if u.get("email"):
+        bits.append(u["email"])
+    if u.get("username") and u.get("fullName"):
+        bits.append("@" + u["username"])
+    return "  %s\n    id: %s" % ("  |  ".join(str(b) for b in bits if b), u.get("id"))
+
+
+def print_page(res, key="items"):
+    """Print pagination footer if present."""
+    if not isinstance(res, dict):
+        return
+    if res.get("hasMore"):
+        cur = res.get("oldestCursor")
+        tail = "  (more available"
+        if cur:
+            tail += "; next: --cursor '%s' --direction before" % cur
+        tail += ")"
+        print(tail)
+
+
+# --------------------------------------------------------------------------- #
+# commands
+# --------------------------------------------------------------------------- #
+
+def cmd_accounts(a):
+    res = request("GET", "/v1/accounts")
+    if a.json:
+        return out_json(res)
+    items = res if isinstance(res, list) else res.get("items", [])
+    for acc in items:
+        u = acc.get("user") or {}
+        name = u.get("fullName") or u.get("username") or ""
+        phone = u.get("phoneNumber") or ""
+        print("%-52s %s %s" % (acc.get("accountID"), name, ("(%s)" % phone) if phone else ""))
+
+
+def cmd_chats(a):
+    params = {"limit": a.limit, "cursor": a.cursor}
+    if a.account:
+        params["accountIDs"] = [a.account]
+    if a.unread:
+        params["unreadOnly"] = True
+    if a.inbox:
+        params["inbox"] = a.inbox
+    if a.cursor and not a.direction:
+        params["direction"] = "before"
+    elif a.direction:
+        params["direction"] = a.direction
+    res = request("GET", "/v1/chats/search", params=params)
+    if a.json:
+        return out_json(res)
+    for c in res.get("items", []):
+        print(fmt_chat(c))
+        print()
+    print_page(res)
+
+
+def cmd_find_chat(a):
+    params = {"query": a.query, "limit": a.limit, "scope": a.scope}
+    if a.account:
+        params["accountIDs"] = [a.account]
+    res = request("GET", "/v1/chats/search", params=params)
+    if a.json:
+        return out_json(res)
+    items = res.get("items", [])
+    if not items:
+        print("No chats matched %r (scope=%s). Try --scope participants." % (a.query, a.scope))
+        return
+    for c in items:
+        print(fmt_chat(c))
+        print()
+
+
+def cmd_chat(a):
+    res = request("GET", "/v1/chats/" + urllib.parse.quote(a.chatID, safe=""),
+                  params={"maxParticipantCount": a.max_participants})
+    if a.json:
+        return out_json(res)
+    print(fmt_chat(res))
+    parts = (res.get("participants") or {}).get("items") or []
+    if parts:
+        print("\n  Participants (%d shown of %s):" % (len(parts), (res.get("participants") or {}).get("total")))
+        for u in parts:
+            print(fmt_user(u))
+
+
+def cmd_messages(a):
+    """The API has no `limit` param here: it returns pages of 20, newest first.
+    We auto-paginate backwards (direction=before) until `limit` is satisfied."""
+    path = "/v1/chats/" + urllib.parse.quote(a.chatID, safe="") + "/messages"
+    limit = a.limit or 20
+    cursor = a.cursor
+    direction = a.direction or ("before" if cursor else None)
+    items = []
+    has_more = False
+    oldest_cursor = None
+    for _ in range(50):  # hard stop against runaway paging
+        params = {"cursor": cursor, "direction": direction}
+        res = request("GET", path, params=params)
+        page = res.get("items", [])
+        items.extend(page)
+        has_more = bool(res.get("hasMore"))
+        oldest_cursor = res.get("oldestCursor") or oldest_cursor
+        if len(items) >= limit or not has_more or not page or not res.get("oldestCursor"):
+            break
+        cursor = res["oldestCursor"]
+        direction = "before"
+    items = items[:limit]  # API returns newest-first
+    if a.json:
+        return out_json({"items": items, "hasMore": has_more, "oldestCursor": oldest_cursor})
+    for m in reversed(items):  # print oldest -> newest, like a chat window
+        print(fmt_message(m))
+        print()
+    if has_more and oldest_cursor:
+        print("  (older messages available; --cursor '%s' --direction before)" % oldest_cursor)
+
+
+def cmd_send(a):
+    body = {"text": a.text}
+    if a.reply_to:
+        body["replyToMessageID"] = a.reply_to
+    if a.attach:
+        up = _upload_file(a.attach)
+        att = {"uploadID": up["uploadID"]}
+        for k in ("fileName", "mimeType"):
+            if up.get(k):
+                att[k] = up[k]
+        if up.get("width") and up.get("height"):
+            att["size"] = {"width": up["width"], "height": up["height"]}
+        if up.get("duration"):
+            att["duration"] = up["duration"]
+        body["attachment"] = att
+    res = request("POST", "/v1/chats/" + urllib.parse.quote(a.chatID, safe="") + "/messages", body=body)
+    if a.json:
+        return out_json(res)
+    print("Sent to %s (pendingMessageID: %s)" % (res.get("chatID"), res.get("pendingMessageID")))
+
+
+def cmd_edit(a):
+    res = request("PUT", "/v1/chats/%s/messages/%s" % (
+        urllib.parse.quote(a.chatID, safe=""), urllib.parse.quote(a.messageID, safe="")),
+        body={"text": a.text})
+    if a.json:
+        return out_json(res)
+    print("Edited %s" % a.messageID)
+
+
+def cmd_react(a):
+    res = request("POST", "/v1/chats/%s/messages/%s/reactions" % (
+        urllib.parse.quote(a.chatID, safe=""), urllib.parse.quote(a.messageID, safe="")),
+        body={"reactionKey": a.emoji})
+    if a.json:
+        return out_json(res)
+    print("Reacted %s to %s" % (a.emoji, a.messageID))
+
+
+def cmd_unreact(a):
+    res = request("DELETE", "/v1/chats/%s/messages/%s/reactions" % (
+        urllib.parse.quote(a.chatID, safe=""), urllib.parse.quote(a.messageID, safe="")),
+        params={"reactionKey": a.emoji})
+    if a.json:
+        return out_json(res)
+    print("Removed reaction %s from %s" % (a.emoji, a.messageID))
+
+
+def cmd_search_messages(a):
+    params = {
+        "query": a.query,
+        "limit": a.limit,
+        "cursor": a.cursor,
+        "sender": a.sender,
+        "dateAfter": a.after,
+        "dateBefore": a.before,
+        "chatType": a.chat_type,
+    }
+    if a.chat:
+        params["chatIDs"] = [a.chat]
+    if a.account:
+        params["accountIDs"] = [a.account]
+    if a.media:
+        params["mediaTypes"] = [a.media]
+    if a.cursor:
+        params["direction"] = a.direction or "before"
+    res = request("GET", "/v1/messages/search", params=params)
+    if a.json:
+        return out_json(res)
+    chats = res.get("chats") or {}
+    items = res.get("items", [])
+    if not items:
+        print("No messages matched %r." % a.query)
+        return
+    for m in items:
+        title = (chats.get(m.get("chatID")) or {}).get("title")
+        print(fmt_message(m, chat_title=title))
+        print("    chatID: %s" % m.get("chatID"))
+        print()
+    print_page(res)
+
+
+def cmd_search(a):
+    res = request("GET", "/v1/search", params={"query": a.query})
+    if a.json:
+        return out_json(res)
+    r = res.get("results", {})
+    for label in ("chats", "in_groups"):
+        rows = r.get(label) or []
+        if rows:
+            print("== %s (%d) ==" % (label.upper(), len(rows)))
+            for c in rows:
+                print(fmt_chat(c))
+                print()
+    msgs = (r.get("messages") or {})
+    items = msgs.get("items") or []
+    if items:
+        print("== MESSAGES (%d) ==" % len(items))
+        chats = msgs.get("chats") or {}
+        for m in items:
+            print(fmt_message(m, chat_title=(chats.get(m.get("chatID")) or {}).get("title")))
+            print("    chatID: %s" % m.get("chatID"))
+            print()
+
+
+def cmd_contacts(a):
+    res = request("GET", "/v1/accounts/%s/contacts" % urllib.parse.quote(a.accountID, safe=""),
+                  params={"query": a.query})
+    if a.json:
+        return out_json(res)
+    items = res.get("items", []) if isinstance(res, dict) else res
+    if not items:
+        print("No contacts matched %r." % a.query)
+    for u in items:
+        print(fmt_user(u))
+
+
+def cmd_list_contacts(a):
+    params = {"limit": a.limit, "cursor": a.cursor, "query": a.query}
+    res = request("GET", "/v1/accounts/%s/contacts/list" % urllib.parse.quote(a.accountID, safe=""),
+                  params=params)
+    if a.json:
+        return out_json(res)
+    for u in res.get("items", []):
+        print(fmt_user(u))
+    print_page(res)
+
+
+def cmd_new_chat(a):
+    body = {"accountID": a.accountID, "participantIDs": a.participantIDs}
+    if a.mode:
+        body["mode"] = a.mode
+    if a.type:
+        body["type"] = a.type
+    elif len(a.participantIDs) > 1:
+        body["type"] = "group"
+    if a.title:
+        body["title"] = a.title
+    if a.message:
+        body["messageText"] = a.message
+    res = request("POST", "/v1/chats", body=body)
+    if a.json:
+        return out_json(res)
+    out_json(res)
+
+
+def cmd_archive(a):
+    res = request("POST", "/v1/chats/%s/archive" % urllib.parse.quote(a.chatID, safe=""),
+                  body={"archived": True})
+    print(json.dumps(res) if a.json else "Archived %s" % a.chatID)
+
+
+def cmd_unarchive(a):
+    res = request("POST", "/v1/chats/%s/archive" % urllib.parse.quote(a.chatID, safe=""),
+                  body={"archived": False})
+    print(json.dumps(res) if a.json else "Unarchived %s" % a.chatID)
+
+
+def cmd_remind(a):
+    try:
+        s = a.when.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.astimezone()
+        ms = int(dt.timestamp() * 1000)
+    except ValueError:
+        die("Could not parse datetime %r. Use ISO8601, e.g. 2026-08-13T09:30:00" % a.when)
+    body = {"reminder": {"remindAtMs": ms, "dismissOnIncomingMessage": bool(a.dismiss_on_incoming)}}
+    res = request("POST", "/v1/chats/%s/reminders" % urllib.parse.quote(a.chatID, safe=""), body=body)
+    print(json.dumps(res) if a.json else "Reminder set for %s on %s" % (local_time(ms), a.chatID))
+
+
+def cmd_unremind(a):
+    res = request("DELETE", "/v1/chats/%s/reminders" % urllib.parse.quote(a.chatID, safe=""))
+    print(json.dumps(res) if a.json else "Reminder cleared on %s" % a.chatID)
+
+
+def _find_attachment_urls(chatID, messageID, max_pages=30):
+    """Walk back through message pages (20/page) looking for messageID."""
+    path = "/v1/chats/" + urllib.parse.quote(chatID, safe="") + "/messages"
+    cursor, direction = None, None
+    for _ in range(max_pages):
+        res = request("GET", path, params={"cursor": cursor, "direction": direction})
+        for m in res.get("items", []):
+            if str(m.get("id")) == str(messageID):
+                return [att.get("srcURL") for att in (m.get("attachments") or []) if att.get("srcURL")], m
+        if not res.get("hasMore") or not res.get("oldestCursor"):
+            break
+        cursor, direction = res["oldestCursor"], "before"
+    return [], None
+
+
+def _file_url_to_path(url):
+    return urllib.parse.unquote(urllib.parse.urlparse(url).path)
+
+
+def _deliver(local_path, out, src_fallback, as_json=False):
+    if as_json:
+        return out_json({"srcURL": src_fallback, "path": local_path})
+    if out and local_path and os.path.exists(local_path):
+        outp = os.path.expanduser(out)
+        if os.path.isdir(outp):
+            outp = os.path.join(outp, os.path.basename(local_path))
+        d = os.path.dirname(os.path.abspath(outp))
+        if d:
+            os.makedirs(d, exist_ok=True)
+        shutil.copyfile(local_path, outp)
+        print(outp)
+    else:
+        print(local_path or src_fallback)
+
+
+def cmd_download(a):
+    target = a.target
+    if target.startswith(("mxc://", "localmxc://", "file://")):
+        url = target
+    else:
+        if not a.messageID:
+            die("Give either an mxc:// / file:// URL, or <chatID> <messageID>.")
+        urls, _msg = _find_attachment_urls(target, a.messageID)
+        if not urls:
+            die("No attachment with a srcURL found on message %s (is it in the recent pages?)" % a.messageID)
+        url = urls[a.index] if a.index < len(urls) else urls[0]
+
+    # Already-cached assets come back as file:// URLs — no API round trip needed.
+    if url.startswith("file://"):
+        return _deliver(_file_url_to_path(url), a.out, url, a.json)
+
+    res = request("POST", "/v1/assets/download", body={"url": url})
+    if isinstance(res, dict) and res.get("error"):
+        die("Download failed: %s" % res["error"])
+    src = (res or {}).get("srcURL") or ""
+    local = _file_url_to_path(src) if src.startswith("file://") else src
+    _deliver(local, a.out, src, a.json)
+
+
+def _upload_file(path):
+    p = Path(os.path.expanduser(path))
+    if not p.is_file():
+        die("No such file: %s" % p)
+    content = base64.b64encode(p.read_bytes()).decode("ascii")
+    body = {"content": content, "fileName": p.name}
+    mt = mimetypes.guess_type(p.name)[0]
+    if mt:
+        body["mimeType"] = mt
+    res = request("POST", "/v1/assets/upload/base64", body=body)
+    if res.get("error"):
+        die("Upload failed: %s" % res["error"])
+    return res
+
+
+def cmd_upload(a):
+    res = _upload_file(a.file)
+    if a.json:
+        return out_json(res)
+    print("uploadID: %s" % res.get("uploadID"))
+    print("fileName: %s  mimeType: %s  size: %s" % (res.get("fileName"), res.get("mimeType"), res.get("fileSize")))
+    print("(use with: beeper send '<chatID>' 'caption' --attach <file>)")
+
+
+def cmd_info(a):
+    res = request("GET", "/v1/info")
+    if a.json:
+        return out_json(res)
+    app = res.get("app", {})
+    srv = res.get("server", {})
+    print("%s %s (%s)" % (app.get("name"), app.get("version"), app.get("bundle_id")))
+    print("server: %s status=%s mcp_enabled=%s" % (srv.get("base_url"), srv.get("status"), srv.get("mcp_enabled")))
+    print("mcp endpoint: %s" % (res.get("endpoints", {}).get("mcp")))
+
+
+def cmd_focus(a):
+    body = {}
+    if a.chatID:
+        body["chatID"] = a.chatID
+    if a.messageID:
+        body["messageID"] = a.messageID
+    if a.draft:
+        body["draftText"] = a.draft
+    res = request("POST", "/v1/focus", body=body or None)
+    print(json.dumps(res) if a.json else "Focused Beeper Desktop.")
+
+
+def cmd_raw(a):
+    params = {}
+    for kv in a.param or []:
+        if "=" not in kv:
+            die("--param must be k=v, got %r" % kv)
+        k, v = kv.split("=", 1)
+        params.setdefault(k, [])
+        params[k].append(v)
+    params = {k: (v[0] if len(v) == 1 else v) for k, v in params.items()}
+    body = json.loads(a.data) if a.data else None
+    path = a.path if a.path.startswith("/") else "/" + a.path
+    res = request(a.method, path, params=params or None, body=body)
+    out_json(res)
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="beeper",
+        description="Control Beeper Desktop (WhatsApp/Telegram/Matrix) via its local REST API.",
+    )
+    p.add_argument("--json", action="store_true", help="Print raw JSON instead of formatted output.")
+    sub = p.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("accounts", help="List connected accounts")
+    s.set_defaults(func=cmd_accounts)
+
+    s = sub.add_parser("chats", help="List chats (most recent first)")
+    s.add_argument("--account", help="accountID to scope to")
+    s.add_argument("--limit", type=int, default=20, help="1-200 (default 20)")
+    s.add_argument("--unread", action="store_true", help="Only chats with unread messages")
+    s.add_argument("--inbox", choices=["primary", "low-priority", "archive"])
+    s.add_argument("--cursor")
+    s.add_argument("--direction", choices=["before", "after"])
+    s.set_defaults(func=cmd_chats)
+
+    s = sub.add_parser("find-chat", help="Search chats by title (or participants)")
+    s.add_argument("query")
+    s.add_argument("--account")
+    s.add_argument("--limit", type=int, default=20)
+    s.add_argument("--scope", choices=["titles", "participants"], default="titles")
+    s.set_defaults(func=cmd_find_chat)
+
+    s = sub.add_parser("chat", help="Chat details incl. participants")
+    s.add_argument("chatID")
+    s.add_argument("--max-participants", type=int, default=50)
+    s.set_defaults(func=cmd_chat)
+
+    s = sub.add_parser("messages", help="List recent messages in a chat")
+    s.add_argument("chatID")
+    s.add_argument("--limit", type=int, default=20, help="Client-side trim to most recent N")
+    s.add_argument("--cursor")
+    s.add_argument("--direction", choices=["before", "after"])
+    s.set_defaults(func=cmd_messages)
+
+    s = sub.add_parser("send", help="Send a message")
+    s.add_argument("chatID")
+    s.add_argument("text")
+    s.add_argument("--reply-to", dest="reply_to", help="messageID to reply to")
+    s.add_argument("--attach", help="Path to a file to upload and attach")
+    s.set_defaults(func=cmd_send)
+
+    s = sub.add_parser("edit", help="Edit a message you sent")
+    s.add_argument("chatID")
+    s.add_argument("messageID")
+    s.add_argument("text")
+    s.set_defaults(func=cmd_edit)
+
+    s = sub.add_parser("react", help="Add a reaction")
+    s.add_argument("chatID")
+    s.add_argument("messageID")
+    s.add_argument("emoji")
+    s.set_defaults(func=cmd_react)
+
+    s = sub.add_parser("unreact", help="Remove a reaction")
+    s.add_argument("chatID")
+    s.add_argument("messageID")
+    s.add_argument("emoji")
+    s.set_defaults(func=cmd_unreact)
+
+    s = sub.add_parser("search-messages", help="Full-text search across messages")
+    s.add_argument("query")
+    s.add_argument("--chat", help="chatID to restrict to")
+    s.add_argument("--account")
+    s.add_argument("--limit", type=int, default=20, help="max 20 (API cap)")
+    s.add_argument("--sender", help="'me', 'others', or a participant ID")
+    s.add_argument("--after", help="ISO8601 date-time (maps to dateAfter)")
+    s.add_argument("--before", help="ISO8601 date-time (maps to dateBefore)")
+    s.add_argument("--chat-type", choices=["single", "group"], dest="chat_type")
+    s.add_argument("--media", choices=["any", "video", "image", "link", "file"])
+    s.add_argument("--cursor")
+    s.add_argument("--direction", choices=["before", "after"])
+    s.set_defaults(func=cmd_search_messages)
+
+    s = sub.add_parser("search", help="Unified search (chats + messages)")
+    s.add_argument("query")
+    s.set_defaults(func=cmd_search)
+
+    s = sub.add_parser("contacts", help="Search contacts on an account")
+    s.add_argument("accountID")
+    s.add_argument("query")
+    s.set_defaults(func=cmd_contacts)
+
+    s = sub.add_parser("list-contacts", help="Paginated contact list for an account")
+    s.add_argument("accountID")
+    s.add_argument("--query")
+    s.add_argument("--limit", type=int, default=50)
+    s.add_argument("--cursor")
+    s.set_defaults(func=cmd_list_contacts)
+
+    s = sub.add_parser("new-chat", help="Create or start a chat")
+    s.add_argument("accountID")
+    s.add_argument("participantIDs", nargs="+")
+    s.add_argument("--mode", choices=["create", "start"], default="start")
+    s.add_argument("--type", choices=["single", "group"])
+    s.add_argument("--title")
+    s.add_argument("--message", help="messageText to send on creation")
+    s.set_defaults(func=cmd_new_chat)
+
+    s = sub.add_parser("archive", help="Archive a chat")
+    s.add_argument("chatID")
+    s.set_defaults(func=cmd_archive)
+
+    s = sub.add_parser("unarchive", help="Unarchive a chat")
+    s.add_argument("chatID")
+    s.set_defaults(func=cmd_unarchive)
+
+    s = sub.add_parser("remind", help="Set a chat reminder")
+    s.add_argument("chatID")
+    s.add_argument("when", help="ISO8601, e.g. 2026-08-13T09:30:00 (local if no offset)")
+    s.add_argument("--dismiss-on-incoming", action="store_true")
+    s.set_defaults(func=cmd_remind)
+
+    s = sub.add_parser("unremind", help="Clear a chat reminder")
+    s.add_argument("chatID")
+    s.set_defaults(func=cmd_unremind)
+
+    s = sub.add_parser("download", help="Download an attachment (mxc:// URL, or chatID + messageID)")
+    s.add_argument("target", help="mxc://... URL or a chatID")
+    s.add_argument("messageID", nargs="?")
+    s.add_argument("--index", type=int, default=0, help="Which attachment on the message")
+    s.add_argument("--out", help="Destination file or directory")
+    s.set_defaults(func=cmd_download)
+
+    s = sub.add_parser("upload", help="Upload a file, returns uploadID")
+    s.add_argument("file")
+    s.set_defaults(func=cmd_upload)
+
+    s = sub.add_parser("info", help="Server / app info")
+    s.set_defaults(func=cmd_info)
+
+    s = sub.add_parser("focus", help="Bring Beeper Desktop to the front (optionally on a chat)")
+    s.add_argument("--chatID")
+    s.add_argument("--messageID")
+    s.add_argument("--draft")
+    s.set_defaults(func=cmd_focus)
+
+    s = sub.add_parser("raw", help="Escape hatch: call any endpoint")
+    s.add_argument("method")
+    s.add_argument("path")
+    s.add_argument("--data", help="JSON request body")
+    s.add_argument("--param", action="append", help="k=v query param (repeatable)")
+    s.set_defaults(func=cmd_raw)
+
+    return p
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    if not getattr(args, "cmd", None):
+        parser.print_help()
+        sys.exit(0)
+    try:
+        args.func(args)
+    except BrokenPipeError:
+        pass
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

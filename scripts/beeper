@@ -148,6 +148,19 @@ def local_time(ts):
         return str(ts)
 
 
+def rfc3339(s):
+    """Normalize user ISO8601 input to RFC3339 with timezone (API rejects naive datetimes)."""
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        die("Could not parse datetime %r. Use ISO8601, e.g. 2026-08-13T09:30:00" % s)
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt.isoformat()
+
+
 _TAG_RE = None
 
 
@@ -427,8 +440,8 @@ def cmd_search_messages(a):
         "limit": a.limit,
         "cursor": a.cursor,
         "sender": a.sender,
-        "dateAfter": a.after,
-        "dateBefore": a.before,
+        "dateAfter": rfc3339(a.after),
+        "dateBefore": rfc3339(a.before),
         "chatType": a.chat_type,
     }
     if a.chat:

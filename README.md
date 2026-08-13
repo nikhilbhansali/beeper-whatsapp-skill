@@ -21,16 +21,15 @@ command exits `2` with `Beeper Desktop is not running.`
 ### Option A — skills.sh
 
 ```bash
-npx skills add <owner>/<repo>
+npx skills add nikhilbhansali/beeper-whatsapp-skill
 ```
 
-(Replace `<owner>/<repo>` with this repository's path on GitHub. See
-[skills.sh](https://skills.sh) for the current CLI.)
+(See [skills.sh](https://skills.sh) for the current CLI.)
 
 ### Option B — manual
 
 ```bash
-git clone <repo-url> ~/.claude/skills/beeper-whatsapp
+git clone https://github.com/nikhilbhansali/beeper-whatsapp-skill ~/.claude/skills/beeper-whatsapp
 chmod +x ~/.claude/skills/beeper-whatsapp/scripts/beeper
 ```
 
